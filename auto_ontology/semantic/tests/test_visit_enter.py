@@ -1,0 +1,1379 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for process_table taxonomy compilation."""
+
+from __future__ import annotations
+
+import re
+from datetime import date, datetime
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pandas as pd
+
+import pytest
+
+from auto_ontology.semantic.visit_enter import (
+    _MAX_CONSECUTIVE_SAMPLE_FAILURES,
+    _distinct_values_if_low_cardinality,
+    _PROFILING_QUERY_TIMEOUT_SECONDS,
+    _json_ready_sample,
+    _keep_persisted_sample,
+    _sample_key,
+    _sampling_breaker,
+    calculate_columns_profiling,
+    probe_ascending_distinct_values,
+    process_table,
+    reset_sampling_breaker,
+)
+from auto_ontology.utils.sql_identifiers import qualified_name
+
+
+@pytest.fixture(autouse=True)
+def store_distinct_ratios():
+    with patch(
+        "auto_ontology.semantic.visit_enter.store_column_distinct_ratios"
+    ) as store:
+        yield store
+
+
+@pytest.fixture(autouse=True)
+def store_key_values():
+    with patch(
+        "auto_ontology.semantic.visit_enter.store_column_distinct_values"
+    ) as store:
+        yield store
+
+
+def _mock_connector(dialect: str = "postgres") -> MagicMock:
+    """A mock connector that qualifies names the way a real one would.
+
+    ``calculate_columns_profiling`` delegates qualification to the connector,
+    so a bare MagicMock would interpolate a repr into the SQL and every
+    assertion on the generated statement would pass vacuously.
+    """
+    connector = MagicMock()
+    connector.dialect = dialect
+    connector.qualify.side_effect = lambda schema, table: qualified_name(
+        schema, table, dialect=dialect
+    )
+    return connector
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (np.int64(7), 7),
+        (np.float64(1.5), 1.5),
+        (np.bool_(True), True),
+        (Decimal("10"), 10),
+        (Decimal("10.5"), 10.5),
+        (datetime(2020, 1, 2, 3, 4, 5), "2020-01-02T03:04:05"),
+        (date(2020, 1, 2), "2020-01-02"),
+        (b"bytes", "bytes"),
+        (["a", np.int64(1)], ["a", 1]),
+        ({"k": Decimal("2")}, {"k": 2}),
+        ("plain", "plain"),
+        (None, None),
+    ],
+)
+def test_json_ready_sample_converts_driver_types(raw: object, expected: object) -> None:
+    converted = _json_ready_sample(raw)
+    assert converted == expected
+    # numpy scalars compare equal to their Python counterparts, so identity of
+    # the type is the only thing that shows the unwrap actually happened.
+    assert type(converted) is type(expected)
+
+
+def test_sample_key_separates_values_a_str_key_would_merge() -> None:
+    # str() would render all three as "1"/"True" collisions across types.
+    assert len({_sample_key(1), _sample_key("1"), _sample_key(True)}) == 3
+    # Unhashable values still get a key, and equal ones share it.
+    assert _sample_key(["a", "b"]) == _sample_key(["a", "b"])
+    assert _sample_key({"k": 1}) != _sample_key({"k": 2})
+
+
+def test_keep_persisted_sample_caps_text_only() -> None:
+    assert _keep_persisted_sample("short") is True
+    assert _keep_persisted_sample("x" * 31) is False
+    assert _keep_persisted_sample(10**40) is True
+    assert _keep_persisted_sample(1.5) is True
+    assert _keep_persisted_sample(False) is True
+    # Non-scalars are judged by how long they render.
+    assert _keep_persisted_sample(["a", "b"]) is True
+    assert _keep_persisted_sample(["x" * 40]) is False
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_a_column_is_unique_when_95_percent_of_its_values_are_distinct(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+    store_distinct_ratios: MagicMock,
+) -> None:
+    connector = _mock_connector()
+    connector.execute.return_value = pd.DataFrame(
+        {
+            "mostly_distinct": [*range(19), 0],
+            "repeated": [*range(18), 0, 0],
+            "small_enum": [*"ABCDE", *[None] * 15],
+            "small_repeat": [*"ABCDA", *[None] * 15],
+            "empty": [None] * 20,
+        }
+    )
+    columns = [
+        {"name": "mostly_distinct", "data_type": "integer"},
+        {"name": "repeated", "data_type": "integer"},
+        {"name": "small_enum", "data_type": "integer"},
+        {"name": "small_repeat", "data_type": "integer"},
+        {"name": "empty", "data_type": "integer"},
+    ]
+
+    result = calculate_columns_profiling(
+        {"id": "t1", "name": "t", "schema_name": "public"}, columns, connector
+    )
+
+    assert {name: profile["is_unique"] for name, profile in result.items()} == {
+        "mostly_distinct": True,
+        "repeated": False,
+        "small_enum": True,
+        "small_repeat": False,
+        "empty": False,
+    }
+    store_distinct_ratios.assert_called_once_with(
+        "t1",
+        {
+            "mostly_distinct": 0.95,
+            "repeated": 0.9,
+            "small_enum": 1.0,
+            "small_repeat": 0.8,
+        },
+    )
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_quotes_name_with_space(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    # Unquoted "main.Sales Orders" parses as table main.Sales, so the probe
+    # raised "no such table" and every column of the table was dropped.
+    df = pd.DataFrame({"OrderDate": ["5/31/18", "6/1/18", "12/4/18"]})
+    connector = _mock_connector("sqlite")
+    connector.execute.return_value = df
+
+    table = {"id": "t1", "name": "Sales Orders", "schema_name": "main"}
+    columns = [{"name": "OrderDate", "data_type": "TEXT"}]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    sql = connector.execute.call_args_list[0][0][0]
+    assert '"main"."Sales Orders"' in sql
+    assert result["OrderDate"]["format"] == "M/D/YY"
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_profiling_probe_uses_the_connectors_qualification(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    # Three-level engines (Kyuubi/Trino/Databricks) prepend their bound catalog.
+    # Building schema.table here instead sent the probe to the default catalog,
+    # where the tables do not exist -- 197/197 tables failed, silently.
+    connector = MagicMock()
+    connector.dialect = "spark"
+    connector.qualify.side_effect = lambda schema, table: qualified_name(
+        "nvapp", schema, table, dialect="spark"
+    )
+    connector.execute.return_value = pd.DataFrame({"id": [1, 2, 3]})
+
+    table = {"id": "t1", "name": "tbl_Click", "schema_name": "nvapp_client"}
+    columns = [{"name": "id", "data_type": "BIGINT"}]
+
+    calculate_columns_profiling(table, columns, connector)
+
+    connector.qualify.assert_called_once_with("nvapp_client", "tbl_Click")
+    sql = connector.execute.call_args_list[0][0][0]
+    assert "`nvapp`.`nvapp_client`.`tbl_Click`" in sql
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_unhashable_values(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    # Postgres array / JSON columns come back as Python lists/dicts, which are
+    # unhashable — profiling must not crash on them.
+    df = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "tags": [["a", "b"], ["a", "b"]],
+            "meta": [{"k": 1}, {"k": 2}],
+        }
+    )
+    connector = _mock_connector()
+    connector.execute.return_value = df
+
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    columns = [
+        {"name": "id", "data_type": "integer"},
+        {"name": "tags", "data_type": "ARRAY"},
+        {"name": "meta", "data_type": "jsonb"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert set(result) == {"id", "tags", "meta"}
+    assert result["tags"]["is_unique"] is False  # ["a","b"] repeated
+    assert result["meta"]["is_unique"] is True
+    assert result["id"]["is_unique"] is True
+
+    # Containers stay containers rather than being flattened to their repr.
+    assert result["tags"]["sample_values"] == [["a", "b"]]
+    assert result["meta"]["sample_values"] == [{"k": 1}, {"k": 2}]
+
+    stored = mock_store_samples.call_args[0][1]
+    assert stored["id"] == [1, 2]
+    assert stored["tags"] == [["a", "b"]]
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_text_typed_array_column(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    """A ClickHouse ``Array(String)`` column must not abort the table.
+
+    The declared-type gate matches on substrings, so ``Array(String)`` counts
+    as text and its values reach the date-shape scan — but they are lists, not
+    strings. That used to raise TypeError out of ``re.match``, which the caller
+    caught as "column profiling failed" and dropped the samples, uniqueness and
+    date formats for *every* column in the table, not just this one.
+    """
+    df = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "labels": [["a", "b"], ["c"]],
+            "created": ["2012-08-24", "2014/07/09"],
+        }
+    )
+    connector = _mock_connector()
+    connector.execute.return_value = df
+
+    table = {"id": "t1", "name": "events", "schema_name": "default"}
+    columns = [
+        {"name": "id", "data_type": "Int64"},
+        {"name": "labels", "data_type": "Array(String)"},
+        {"name": "created", "data_type": "String"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert set(result) == {"id", "labels", "created"}
+    assert result["labels"]["sample_values"] == [["a", "b"], ["c"]]
+
+    # The genuinely-text column is still scanned, so the mixed-format warning
+    # survives the fix rather than being lost with the crash.
+    stored = mock_store_samples.call_args[0][1]
+    assert any(
+        isinstance(v, str) and "mixed date formats observed" in v
+        for v in stored["created"]
+    )
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "status": ["open", "open", "closed", "open"],
+            "created_at": ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+            "token": ["a" * 40, "b" * 40, "a" * 40, "c" * 40],
+        }
+    )
+
+    def _fake_execute(sql: str) -> pd.DataFrame:
+        # The main profiling query (SELECT *) gets the full table. A
+        # per-column DISTINCT probe (see _distinct_values_if_low_cardinality)
+        # fires for non-unique text columns ("status", "token" here) — a
+        # real connector would return only that column, so the mock must
+        # too, or df.iloc[:, 0] silently reads whichever column comes first
+        # instead of the one actually queried.
+        match = re.search(r'SELECT DISTINCT "([^"]+)"', sql)
+        if not match:
+            return df
+        col = match.group(1)
+        return pd.DataFrame({col: df[col].dropna().unique().tolist()})
+
+    connector = _mock_connector()
+    connector.execute.side_effect = _fake_execute
+
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    columns = [
+        {"name": "id", "data_type": "integer"},
+        {"name": "status", "data_type": "text"},
+        {"name": "created_at", "data_type": "timestamp"},
+        {"name": "token", "data_type": "text"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    # The main profiling query is the first connector.execute call — later
+    # calls (e.g. a per-column DISTINCT check for long-string columns like
+    # "token") would otherwise shadow it if we looked at call_args (last call).
+    sql = connector.execute.call_args_list[0][0][0]
+    assert '"public"."orders"' in sql
+    assert "LIMIT 1000" in sql
+    assert connector.execute.call_count == 3
+
+    # Returned dict includes every column (dates, long strings included),
+    # each with its top-5 sample values and is_unique flag.
+    assert set(result) == {"id", "status", "created_at", "token"}
+    assert result["status"]["sample_values"][0] == "open"
+    assert len(result["created_at"]["sample_values"]) == 4
+    assert result["id"]["is_unique"] is True
+    assert result["status"]["is_unique"] is False
+    assert result["created_at"]["is_unique"] is True
+    assert result["token"]["is_unique"] is False
+    assert result["created_at"]["format"] == "YYYY-MM-DD"
+    mock_store_dates.assert_called_once()
+    assert mock_store_dates.call_args[0][1] == {"created_at": "YYYY-MM-DD"}
+
+    # Uniqueness persisted for every column.
+    uniqueness = mock_store_unique.call_args[0][1]
+    assert uniqueness == {
+        "id": True,
+        "status": False,
+        "created_at": True,
+        "token": False,
+    }
+
+    # Stored sample values exclude the date column and the >30-char token values.
+    stored = mock_store_samples.call_args[0][1]
+    assert "created_at" not in stored
+    assert "token" not in stored
+    assert stored["status"][0] == "open"
+    assert stored["id"] == [1, 2, 3, 4]
+    assert all(type(v) is int for v in stored["id"])
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_preserves_scalar_types(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    """Numbers and booleans profile as themselves, not as their str() form."""
+    df = pd.DataFrame(
+        {
+            "amount": [10, 20, 10, 30],
+            "ratio": [1.5, 2.5, 1.5, 3.5],
+            "active": [True, False, True, True],
+            # Wider than the 30-char cap once rendered — the cap is about prose,
+            # so a number is kept however many digits it has.
+            "big": [10**40, 10**41, 10**40, 10**42],
+            "label": ["a" * 40, "b", "a" * 40, "c"],
+        }
+    )
+    connector = _mock_connector()
+    # Only `label` is text with fewer than 5 distinct values, so it is the one
+    # column that triggers a DISTINCT probe; return empty to keep the top-N set.
+    connector.execute.side_effect = [df, pd.DataFrame({"label": []})]
+
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    columns = [
+        {"name": "amount", "data_type": "integer"},
+        {"name": "ratio", "data_type": "numeric"},
+        {"name": "active", "data_type": "boolean"},
+        {"name": "big", "data_type": "numeric"},
+        {"name": "label", "data_type": "text"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert result["amount"]["sample_values"] == [10, 20, 30]
+    assert result["ratio"]["sample_values"] == [1.5, 2.5, 3.5]
+    assert result["active"]["sample_values"] == [True, False]
+    assert all(isinstance(v, int) for v in result["amount"]["sample_values"])
+    assert all(isinstance(v, float) for v in result["ratio"]["sample_values"])
+    assert all(isinstance(v, bool) for v in result["active"]["sample_values"])
+
+    stored = mock_store_samples.call_args[0][1]
+    assert stored["amount"] == [10, 20, 30]
+    assert stored["ratio"] == [1.5, 2.5, 3.5]
+    assert stored["active"] == [True, False]
+    # The length cap applies to text only: the huge numbers survive, the
+    # 40-char string does not.
+    assert stored["big"] == [10**40, 10**41, 10**42]
+    assert stored["label"] == ["b", "c"]
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_infers_date_format(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    # Every column here is unique, so no DISTINCT-cardinality probe fires —
+    # kept simple/isolated from test_calculate_columns_profiling, which
+    # exercises that probe (via non-unique "status"/"token" columns) instead.
+    df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "created_at": ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+        }
+    )
+    connector = MagicMock()
+    connector.execute.return_value = df
+
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    columns = [
+        {"name": "id", "data_type": "integer"},
+        {"name": "created_at", "data_type": "timestamp"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert result["created_at"]["format"] == "YYYY-MM-DD"
+    mock_store_dates.assert_called_once()
+    assert mock_store_dates.call_args[0][1] == {"created_at": "YYYY-MM-DD"}
+    # Declared date/timestamp type: sample_values stay excluded regardless of
+    # the format inference (pre-existing _is_excluded_sample_type behavior).
+    stored = mock_store_samples.call_args[0][1]
+    assert "created_at" not in stored
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_text_column_with_date_format_keeps_sample_values(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    """A TEXT-typed date column, unlike a declared date/timestamp type, keeps
+    its persisted sample_values alongside the inferred format — samples stay
+    available to semantic_fk.py's SQL-probe fallback (which reads persisted
+    Column.sample_values, not this call's in-memory profiling dict), and date
+    values are short enough that keeping them costs little.
+    """
+    df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "signup_date": ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+        }
+    )
+    connector = MagicMock()
+    connector.execute.return_value = df
+
+    table = {"id": "t1", "name": "users", "schema_name": "public"}
+    columns = [
+        {"name": "id", "data_type": "integer"},
+        {"name": "signup_date", "data_type": "text"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert result["signup_date"]["format"] == "YYYY-MM-DD"
+    stored = mock_store_samples.call_args[0][1]
+    assert "signup_date" in stored
+    assert set(stored["signup_date"]) == {
+        "2020-01-01",
+        "2020-01-02",
+        "2020-01-03",
+        "2020-01-04",
+    }
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_calculate_columns_profiling_distinct_only_when_under_top_n(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    """DISTINCT probes run only for text columns with fewer than 5 sample values."""
+    sample_df = pd.DataFrame(
+        {
+            # 5+ distinct values in the sample → no DISTINCT probe.
+            "city": ["a", "b", "c", "d", "e", "a"],
+            # Fewer than 5 distinct values → DISTINCT probe for rare enums.
+            "status": ["open", "open", "closed", "open", "open", "open"],
+        }
+    )
+    status_distinct_df = pd.DataFrame({"status": ["open", "closed", "banned"]})
+
+    connector = _mock_connector()
+    connector.execute.side_effect = [sample_df, status_distinct_df]
+
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+    columns = [
+        {"name": "city", "data_type": "string"},
+        {"name": "status", "data_type": "text"},
+    ]
+
+    result = calculate_columns_profiling(table, columns, connector)
+
+    assert connector.execute.call_count == 2
+    distinct_sql = connector.execute.call_args_list[1][0][0]
+    assert "SELECT DISTINCT" in distinct_sql
+    assert '"status"' in distinct_sql
+    assert '"city"' not in distinct_sql
+
+    assert result["city"]["sample_values"] == ["a", "b", "c", "d", "e"]
+    assert "banned" in result["status"]["sample_values"]
+    assert "open" in result["status"]["sample_values"]
+    assert "closed" in result["status"]["sample_values"]
+
+
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_writes_term_and_attributes(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import (
+        PotentialFkResult,
+        TableTermsResult,
+        TermAttributeAssignment,
+        TermProposal,
+    )
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(
+        terms=[
+            TermProposal(
+                name="Order",
+                description="Order entity",
+                attributes=[
+                    TermAttributeAssignment(
+                        source_column="amount",
+                        display_name="Total Amount",
+                    )
+                ],
+            )
+        ]
+    )
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    ctx = {
+        "columns": [{"name": "amount", "data_type": "numeric"}],
+        "fks": [],
+    }
+    mock_upsert_term.return_value = ("term-id", "Order (db.public.orders)")
+
+    process_table(table, ctx, domain_summary=None)
+
+    mock_upsert_term.assert_called_once_with("Order", "Order entity", "t1", synonyms=[])
+    assert (
+        mock_merge_col_attr.call_args.kwargs["term_name"] == "Order (db.public.orders)"
+    )
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_distinct_probe_is_gated_but_the_row_sample_is_not(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    """The setting governs the DISTINCT probes only.
+
+    ``SELECT * ... LIMIT`` is bounded and always runs. The DISTINCT probe is
+    the unbounded one -- a full-column scan per column where DISTINCT + LIMIT
+    does not early-stop -- so it is the one worth turning off.
+    """
+    # `status` is non-unique text with fewer than _PROFILING_TOP_N distinct
+    # sampled values, which is exactly the shape that triggers a DISTINCT probe.
+    df = pd.DataFrame({"status": ["open", "open", "closed"]})
+    columns = [{"name": "status", "data_type": "text"}]
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+
+    off = _mock_connector()
+    off.execute.return_value = df
+    calculate_columns_profiling(table, columns, off, probe_distinct_values=False)
+    off_sql = [c[0][0] for c in off.execute.call_args_list]
+
+    on = _mock_connector()
+    on.execute.side_effect = [df, pd.DataFrame({"status": ["banned"]})]
+    calculate_columns_profiling(table, columns, on, probe_distinct_values=True)
+    on_sql = [c[0][0] for c in on.execute.call_args_list]
+
+    # Both sample the rows; only the enabled one issues the DISTINCT probe.
+    assert sum("SELECT * FROM" in s for s in off_sql) == 1
+    assert sum("SELECT * FROM" in s for s in on_sql) == 1
+    assert not any("SELECT DISTINCT" in s for s in off_sql)
+    assert sum("SELECT DISTINCT" in s for s in on_sql) == 1
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_pii_columns_are_left_out_of_the_row_sample(
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    connector = _mock_connector()
+    connector.execute.return_value = pd.DataFrame(
+        {"status": ["open", "open", "closed"], "Order Id": [1, 2, 3]}
+    )
+    columns = [
+        {"name": "email", "data_type": "text"},
+        {"name": "status", "data_type": "text"},
+        {"name": "Order Id", "data_type": "integer"},
+    ]
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+
+    result = calculate_columns_profiling(
+        table, columns, connector, probe_distinct_values=False, pii_columns={"email"}
+    )
+
+    sql = connector.execute.call_args_list[0][0][0]
+    assert sql == 'SELECT "status", "Order Id" FROM "public"."orders" LIMIT 1000'
+    assert set(result) == {"status", "Order Id"}
+    assert "email" not in mock_store_samples.call_args[0][1]
+
+
+def test_a_table_of_only_pii_columns_is_not_sampled() -> None:
+    connector = _mock_connector()
+    columns = [{"name": "email", "data_type": "text"}]
+    table = {"id": "t1", "name": "users", "schema_name": "public"}
+
+    assert (
+        calculate_columns_profiling(table, columns, connector, pii_columns={"email"})
+        == {}
+    )
+    connector.execute.assert_not_called()
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+@patch("auto_ontology.semantic.visit_enter.pii_tagged_column_ids")
+def test_profiling_looks_up_pii_tags_when_not_given(
+    mock_pii_ids: MagicMock,
+    mock_store_samples: MagicMock,
+    mock_store_unique: MagicMock,
+    mock_store_dates: MagicMock,
+) -> None:
+    mock_pii_ids.return_value = {"c-email"}
+    connector = _mock_connector()
+    connector.execute.return_value = pd.DataFrame({"status": ["open"]})
+    columns = [
+        {"id": "c-email", "name": "email", "data_type": "text"},
+        {"id": "c-status", "name": "status", "data_type": "text"},
+    ]
+    table = {"id": "t1", "name": "orders", "schema_name": "public"}
+
+    calculate_columns_profiling(table, columns, connector, probe_distinct_values=False)
+
+    mock_pii_ids.assert_called_once_with(["c-email", "c-status"])
+    assert connector.execute.call_args_list[0][0][0].startswith('SELECT "status" FROM')
+
+
+@patch("auto_ontology.semantic.visit_enter._store_key_distinct_values")
+@patch("auto_ontology.semantic.visit_enter.clear_column_values")
+@patch("auto_ontology.semantic.visit_enter.pii_tagged_column_ids")
+@patch("auto_ontology.semantic.visit_enter.calculate_columns_profiling")
+@patch("auto_ontology.semantic.visit_enter._resolve_connector")
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_withholds_pii_columns(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+    mock_resolve: MagicMock,
+    mock_profiling: MagicMock,
+    mock_pii_ids: MagicMock,
+    mock_clear: MagicMock,
+    mock_key_probe: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import PotentialFkResult, TableTermsResult
+
+    mock_term.return_value = TableTermsResult(terms=[])
+    mock_profiling.return_value = {}
+    mock_pii_ids.return_value = {"c-email"}
+    seen_by_fk_prompt: list[object] = []
+
+    def _suggest(table: object, ctx: dict, samples: object) -> PotentialFkResult:
+        seen_by_fk_prompt.extend(c.get("sample_values") for c in ctx["columns"])
+        return PotentialFkResult(pk_column_names=["email", "account_id"])
+
+    mock_fk_suggest.side_effect = _suggest
+
+    table = {"id": "t1", "name": "users", "description": "", "schema_name": "public"}
+    ctx = {
+        "columns": [
+            {
+                "id": "c-email",
+                "name": "email",
+                "data_type": "text",
+                "sample_values": '["a@b.c"]',
+            },
+            {
+                "id": "c-acct",
+                "name": "account_id",
+                "data_type": "integer",
+                "sample_values": "[1, 2]",
+            },
+        ],
+        "fks": [],
+    }
+
+    process_table(table, ctx, domain_summary=None, database_name="db")
+
+    assert mock_profiling.call_args.kwargs["pii_columns"] == {"email"}
+    mock_clear.assert_called_once_with("t1", ["email"])
+    assert seen_by_fk_prompt == [None, "[1, 2]"]
+    assert mock_key_probe.call_args[0][2] == {"account_id"}
+
+
+@patch("auto_ontology.semantic.visit_enter._store_key_distinct_values")
+@patch("auto_ontology.semantic.visit_enter.clear_column_values")
+@patch("auto_ontology.semantic.visit_enter.pii_tagged_column_ids")
+@patch("auto_ontology.semantic.visit_enter.calculate_columns_profiling")
+@patch("auto_ontology.semantic.visit_enter._resolve_connector")
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_samples_nothing_when_pii_tags_are_unreadable(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+    mock_resolve: MagicMock,
+    mock_profiling: MagicMock,
+    mock_pii_ids: MagicMock,
+    mock_clear: MagicMock,
+    mock_key_probe: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import PotentialFkResult, TableTermsResult
+
+    mock_term.return_value = TableTermsResult(terms=[])
+    mock_fk_suggest.return_value = PotentialFkResult(pk_column_names=["account_id"])
+    mock_pii_ids.side_effect = RuntimeError("store down")
+
+    table = {"id": "t1", "name": "users", "description": "", "schema_name": "public"}
+    ctx = {
+        "columns": [
+            {
+                "id": "c-acct",
+                "name": "account_id",
+                "data_type": "integer",
+                "sample_values": "[1, 2]",
+            },
+        ],
+        "fks": [],
+    }
+
+    process_table(table, ctx, domain_summary=None, database_name="db")
+
+    mock_profiling.assert_not_called()
+    mock_key_probe.assert_not_called()
+    assert ctx["columns"][0]["sample_values"] is None
+    mock_clear.assert_called_once_with("t1", ["account_id"])
+
+
+@patch("auto_ontology.semantic.visit_enter.get_connectors")
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_row_sample_runs_even_with_the_setting_off(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+    mock_get_connectors: MagicMock,
+) -> None:
+    """``SELECT * ... LIMIT 1000`` is unconditional, end to end.
+
+    Asserted against the real connector-resolution path (``get_connectors``)
+    rather than a patched ``_resolve_connector``, and by recording every SQL
+    string the connector is asked to run.
+    """
+    from auto_ontology.semantic.models import PotentialFkResult, TableTermsResult
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(terms=[])
+
+    executed: list[str] = []
+    spy = MagicMock()
+    spy.database_name = "db"
+    spy.dialect = "spark"
+    spy.qualify.side_effect = lambda s, t: f"`nvapp`.`{s}`.`{t}`"
+
+    def _record(sql: str, *args: object, **kwargs: object) -> pd.DataFrame:
+        executed.append(sql)
+        return pd.DataFrame({"amount": [1, 2, 3]})
+
+    spy.execute.side_effect = _record
+    mock_get_connectors.return_value = [spy]
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
+
+    process_table(
+        table,
+        ctx,
+        domain_summary=None,
+        database_name="db",
+        probe_distinct_values=False,
+    )
+
+    assert executed == ["SELECT * FROM `nvapp`.`public`.`orders` LIMIT 1000"]
+
+
+@patch("auto_ontology.semantic.visit_enter.calculate_columns_profiling")
+@patch("auto_ontology.semantic.visit_enter._resolve_connector")
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_profiles_by_default(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+    mock_resolve: MagicMock,
+    mock_profiling: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import PotentialFkResult, TableTermsResult
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(terms=[])
+    mock_profiling.return_value = {}
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
+
+    process_table(table, ctx, domain_summary=None, database_name="db")
+
+    mock_profiling.assert_called_once()
+
+
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_skips_fk_columns(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import (
+        PotentialFkResult,
+        TableTermsResult,
+        TermProposal,
+    )
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(
+        terms=[TermProposal(name="Order", description="", attributes=[])]
+    )
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": ""}
+    ctx = {
+        "columns": [{"name": "customer_id", "data_type": "integer"}],
+        "fks": [
+            {
+                "source_column": "customer_id",
+                "target_table": "customers",
+                "target_table_id": "t2",
+            }
+        ],
+    }
+
+    process_table(table, ctx, domain_summary=None)
+
+    mock_upsert_term.assert_not_called()
+
+
+def test_process_table_marks_a_wide_llm_junction() -> None:
+    from auto_ontology.semantic.models import PotentialFkResult
+
+    table = {"id": "line", "name": "order_product", "schema_name": "public"}
+    ctx = {
+        "columns": [
+            {"name": "order_id", "data_type": "integer"},
+            {"name": "product_id", "data_type": "integer"},
+            {"name": "quantity", "data_type": "integer"},
+        ],
+        "fks": [
+            {"source_column": "order_id", "target_table": "orders"},
+            {"source_column": "product_id", "target_table": "products"},
+        ],
+    }
+    decision = PotentialFkResult(
+        is_junction_table=True,
+        junction_table_rationale="Relationship payload between orders and products.",
+    )
+
+    with (
+        patch(
+            "auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys",
+            return_value=decision,
+        ),
+        patch(
+            "auto_ontology.semantic.visit_enter.column_attribute_specs", return_value=[]
+        ),
+        patch("auto_ontology.semantic.visit_enter.mark_table_as_junction") as mock_mark,
+    ):
+        process_table(table, ctx, domain_summary=None)
+
+    mock_mark.assert_called_once_with("line")
+
+
+@pytest.mark.parametrize(
+    ("columns", "declared_fks"),
+    [
+        (
+            [
+                {"name": "left_id", "data_type": "integer"},
+                {"name": "right_id", "data_type": "integer"},
+            ],
+            [
+                {"source_column": "left_id", "target_table": "entities"},
+                {"source_column": "right_id", "target_table": "entities"},
+            ],
+        ),
+        (
+            [
+                {"name": "customer_id", "data_type": "integer"},
+                {"name": "preference", "data_type": "text"},
+                {"name": "updated_at", "data_type": "timestamp"},
+            ],
+            [{"source_column": "customer_id", "target_table": "customers"}],
+        ),
+    ],
+)
+def test_process_table_rejects_insufficient_structural_junction_evidence(
+    columns: list[dict[str, str]],
+    declared_fks: list[dict[str, str]],
+) -> None:
+    from auto_ontology.semantic.models import PotentialFkResult
+
+    decision = PotentialFkResult(
+        is_junction_table=True,
+        junction_table_rationale="Intentionally over-positive LLM fixture.",
+    )
+    table = {"id": "candidate", "name": "candidate", "schema_name": "public"}
+    ctx = {"columns": columns, "fks": declared_fks}
+
+    with (
+        patch(
+            "auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys",
+            return_value=decision,
+        ),
+        patch(
+            "auto_ontology.semantic.visit_enter.column_attribute_specs", return_value=[]
+        ),
+        patch("auto_ontology.semantic.visit_enter.mark_table_as_junction") as mock_mark,
+    ):
+        process_table(table, ctx, domain_summary=None)
+
+    mock_mark.assert_not_called()
+
+
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_process_table_multiple_terms(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+) -> None:
+    from auto_ontology.semantic.models import (
+        PotentialFkResult,
+        TableTermsResult,
+        TermAttributeAssignment,
+        TermProposal,
+    )
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(
+        terms=[
+            TermProposal(
+                name="Order",
+                description="Core order",
+                attributes=[
+                    TermAttributeAssignment(
+                        source_column="amount", display_name="Total Amount"
+                    )
+                ],
+            ),
+            TermProposal(
+                name="Audit Metadata",
+                description="Audit fields",
+                attributes=[
+                    TermAttributeAssignment(
+                        source_column="created_at", display_name="Created At"
+                    )
+                ],
+            ),
+        ]
+    )
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    ctx = {
+        "columns": [
+            {"name": "amount", "data_type": "numeric"},
+            {"name": "created_at", "data_type": "timestamp"},
+        ],
+        "fks": [],
+    }
+    mock_upsert_term.side_effect = [
+        ("term-1", "Order"),
+        ("term-2", "Audit Metadata"),
+    ]
+
+    process_table(table, ctx, domain_summary=None)
+
+    assert mock_upsert_term.call_count == 2
+    assert mock_merge_col_attr.call_count == 2
+
+
+# ----------------------------------------------------------------------
+# Sample query cap and circuit breaker
+# ----------------------------------------------------------------------
+
+
+class _CappedConnector:
+    """A connector whose execute() accepts a timeout, like Kyuubi's."""
+
+    dialect = "spark"
+    database_name = "nvdp"
+    supports_statement_timeout = True
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[str, int | None]] = []
+
+    def qualify(self, schema: str, table: str) -> str:
+        return f"`{schema}`.`{table}`"
+
+    def execute(self, sql: str, parameters=None, *, timeout_s: int | None = None):
+        self.calls.append((sql, timeout_s))
+        if self.error is not None:
+            raise self.error
+        return pd.DataFrame({"id": [1, 2]})
+
+
+TABLE = {"id": "t1", "name": "elk_log", "schema_name": "raw"}
+COLUMNS = [{"name": "id", "data_type": "bigint"}]
+
+
+@pytest.fixture(autouse=True)
+def _reset_breaker():
+    reset_sampling_breaker(_CappedConnector.database_name)
+    yield
+    reset_sampling_breaker(_CappedConnector.database_name)
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_sample_query_is_capped_where_the_connector_supports_it(*_mocks) -> None:
+    """A bounded sample is seconds on a healthy engine; 900s means it is not."""
+    connector = _CappedConnector()
+
+    calculate_columns_profiling(TABLE, COLUMNS, connector)
+
+    assert connector.calls[0][1] == _PROFILING_QUERY_TIMEOUT_SECONDS
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_a_connector_without_a_cap_is_called_unchanged(*_mocks) -> None:
+    """Passing timeout_s to a connector that has no such parameter would fail."""
+    connector = _mock_connector()
+    connector.execute.return_value = pd.DataFrame({"id": [1, 2]})
+
+    calculate_columns_profiling(TABLE, COLUMNS, connector)
+
+    assert connector.execute.call_args_list[0].kwargs == {}
+
+
+def test_repeated_sample_timeouts_disable_sampling_for_the_run() -> None:
+    """86 tables x a 120s timeout is three hours that produce nothing."""
+    connector = _CappedConnector(TimeoutError("cancelled after 120s"))
+
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        assert calculate_columns_profiling(TABLE, COLUMNS, connector) == {}
+
+    assert _sampling_breaker.is_open(connector)
+
+
+def test_a_sql_error_on_one_table_does_not_disable_sampling() -> None:
+    """A table the engine refuses says nothing about the other 85."""
+    connector = _CappedConnector(ValueError("Table or view not found: nope"))
+
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES + 2):
+        calculate_columns_profiling(TABLE, COLUMNS, connector)
+
+    assert not _sampling_breaker.is_open(connector)
+
+
+@patch("auto_ontology.semantic.visit_enter.store_column_date_formats")
+@patch("auto_ontology.semantic.visit_enter.store_column_uniqueness")
+@patch("auto_ontology.semantic.visit_enter.store_column_sample_values")
+def test_one_success_clears_the_failure_streak(*_mocks) -> None:
+    """Only *consecutive* failures mean the warehouse itself is gone."""
+    failing = _CappedConnector(TimeoutError("cancelled"))
+    healthy = _CappedConnector()
+
+    calculate_columns_profiling(TABLE, COLUMNS, failing)
+    calculate_columns_profiling(TABLE, COLUMNS, healthy)
+    calculate_columns_profiling(TABLE, COLUMNS, failing)
+    calculate_columns_profiling(TABLE, COLUMNS, failing)
+
+    # Both connectors share a key (the database name), so the success in the
+    # middle is what keeps the breaker closed here.
+    assert not _sampling_breaker.is_open(failing)
+
+
+def test_resetting_one_database_leaves_another_run_alone() -> None:
+    """Compilations for two datasources overlap; one must not re-arm the other."""
+    dead = _CappedConnector(TimeoutError("cancelled"))
+
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        calculate_columns_profiling(TABLE, COLUMNS, dead)
+    assert _sampling_breaker.is_open(dead)
+
+    reset_sampling_breaker("some_other_database")
+
+    assert _sampling_breaker.is_open(dead), (
+        "a run starting elsewhere must not hand this run back a dead warehouse"
+    )
+
+
+def test_distinct_probe_timeouts_count_toward_the_breaker() -> None:
+    """The probe is a full column scan; silent timeouts burn the cap per column."""
+    connector = _CappedConnector()
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        assert (
+            _distinct_values_if_low_cardinality(
+                _CappedConnector(TimeoutError("cancelled")),
+                "`raw`.`elk_log`",
+                "status",
+                25,
+            )
+            is None
+        )
+
+    assert _sampling_breaker.is_open(connector)
+
+
+@patch("auto_ontology.semantic.visit_enter.calculate_columns_profiling")
+@patch("auto_ontology.semantic.visit_enter._resolve_connector")
+@patch("auto_ontology.semantic.visit_enter.merge_column_attribute")
+@patch("auto_ontology.semantic.visit_enter.upsert_table_term")
+@patch("auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys")
+@patch("auto_ontology.semantic.visit_enter.extract_term")
+def test_a_tripped_breaker_stops_process_table_sampling(
+    mock_term: MagicMock,
+    mock_fk_suggest: MagicMock,
+    mock_upsert_term: MagicMock,
+    mock_merge_col_attr: MagicMock,
+    mock_resolve: MagicMock,
+    mock_profiling: MagicMock,
+) -> None:
+    """Tripping the breaker is only worth anything if it saves the 120s."""
+    from auto_ontology.semantic.models import PotentialFkResult, TableTermsResult
+
+    mock_fk_suggest.return_value = PotentialFkResult()
+    mock_term.return_value = TableTermsResult(terms=[])
+    connector = _CappedConnector(TimeoutError("cancelled"))
+    mock_resolve.return_value = connector
+
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        _sampling_breaker.record_failure(connector, TimeoutError("cancelled"))
+    assert _sampling_breaker.is_open(connector)
+
+    table = {"id": "t1", "name": "orders", "description": "", "schema_name": "public"}
+    ctx = {"columns": [{"name": "amount", "data_type": "numeric"}], "fks": []}
+    process_table(table, ctx, domain_summary=None, database_name="nvdp")
+
+    mock_profiling.assert_not_called()
+
+
+def test_the_breaker_key_matches_however_the_database_is_spelled() -> None:
+    """_resolve_connector matches case-insensitively, so the key must too.
+
+    A connector loaded from CONNECTION_STRINGS can spell its database
+    differently from the catalog name the run compiles under; a key that
+    disagreed with the reset would leave sampling off for every later run.
+    """
+
+    class _Shouty(_CappedConnector):
+        database_name = "NVDP"
+
+    dead = _Shouty(TimeoutError("cancelled"))
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        _sampling_breaker.record_failure(dead, TimeoutError("cancelled"))
+    assert _sampling_breaker.is_open(dead)
+
+    reset_sampling_breaker("nvdp")
+
+    assert not _sampling_breaker.is_open(dead)
+
+
+def test_key_value_probe_reads_the_lowest_distinct_values() -> None:
+    connector = _mock_connector()
+    connector.supports_statement_timeout = False
+    connector.execute.return_value = pd.DataFrame({"id": [np.int64(3), np.int64(7)]})
+
+    values = probe_ascending_distinct_values(connector, "raw", "orders", "Order Id")
+
+    assert values == [3, 7]
+    assert connector.execute.call_args.args[0] == (
+        'SELECT DISTINCT "Order Id" FROM "raw"."orders" WHERE "Order Id" IS NOT NULL '
+        'ORDER BY "Order Id" LIMIT 20'
+    )
+
+
+def test_key_value_probe_failure_counts_toward_the_breaker() -> None:
+    connector = _CappedConnector(TimeoutError("cancelled"))
+
+    for _ in range(_MAX_CONSECUTIVE_SAMPLE_FAILURES):
+        assert probe_ascending_distinct_values(connector, "raw", "t", "id") is None
+
+    assert _sampling_breaker.is_open(connector)
+    calls = len(connector.calls)
+    assert probe_ascending_distinct_values(connector, "raw", "t", "id") is None
+    assert len(connector.calls) == calls
+
+
+def _process_keys_table(
+    *, probe_key_values: bool = True
+) -> tuple[MagicMock, MagicMock]:
+    from auto_ontology.semantic.models import (
+        PotentialFkResult,
+        PotentialFkSuggestion,
+        TableTermsResult,
+    )
+
+    table = {
+        "id": "t1",
+        "name": "orders",
+        "description": "",
+        "schema_name": "public",
+        "pk": ["order_no"],
+    }
+    ctx = {
+        "columns": [
+            {"name": name, "data_type": "integer"}
+            for name in ("order_no", "alt_id", "customer_id", "store_ref", "amount")
+        ],
+        "fks": [{"source_column": "customer_id", "target_table": "customers"}],
+    }
+    suggestions = PotentialFkResult(
+        suggestions=[
+            PotentialFkSuggestion(column_name="store_ref", rationale="store key")
+        ],
+        pk_column_names=["alt_id"],
+    )
+    with (
+        patch(
+            "auto_ontology.semantic.visit_enter._resolve_connector",
+            return_value=_mock_connector(),
+        ),
+        patch(
+            "auto_ontology.semantic.visit_enter.calculate_columns_profiling",
+            return_value={},
+        ),
+        patch(
+            "auto_ontology.semantic.visit_enter.suggest_potential_foreign_keys",
+            return_value=suggestions,
+        ),
+        patch(
+            "auto_ontology.semantic.visit_enter.extract_term",
+            return_value=TableTermsResult(terms=[]),
+        ),
+        patch("auto_ontology.semantic.visit_enter.upsert_table_term"),
+        patch("auto_ontology.semantic.visit_enter.merge_column_attribute"),
+        patch(
+            "auto_ontology.semantic.visit_enter.probe_ascending_distinct_values",
+            side_effect=lambda _c, _s, _t, column: [f"{column}-1"],
+        ) as probe,
+        patch(
+            "auto_ontology.semantic.visit_enter.store_column_distinct_values"
+        ) as store,
+    ):
+        process_table(
+            table,
+            ctx,
+            domain_summary=None,
+            database_name="db",
+            probe_key_values=probe_key_values,
+        )
+    return probe, store
+
+
+def test_process_table_probes_suspected_key_columns() -> None:
+    probe, store = _process_keys_table()
+
+    assert [c.args[3] for c in probe.call_args_list] == [
+        "alt_id",
+        "customer_id",
+        "order_no",
+        "store_ref",
+    ]
+    store.assert_called_once_with(
+        "t1",
+        {
+            "alt_id": ["alt_id-1"],
+            "customer_id": ["customer_id-1"],
+            "order_no": ["order_no-1"],
+            "store_ref": ["store_ref-1"],
+        },
+    )
+
+
+def test_process_table_skips_key_probes_when_prevented() -> None:
+    probe, store = _process_keys_table(probe_key_values=False)
+
+    probe.assert_not_called()
+    store.assert_not_called()
